@@ -1,8 +1,7 @@
 #!/bin/bash
-# =====================================
-# 多出口 IP 信息检测脚本（延时优化版）
-# 功能：检测每个公网出口 IP 的平均延时、国家、地区和 ISP
-# =====================================
+# =============================================
+# 🌏 交互式路由追踪 + 中文IP地理信息显示 (Ubuntu 22.04+)
+# =============================================
 
 # 彩色输出定义
 green="\e[32m"
@@ -12,33 +11,46 @@ cyan="\e[36m"
 reset="\e[0m"
 
 # 检查依赖
-for cmd in curl jq ping bc; do
+for cmd in curl jq traceroute ping bc; do
     if ! command -v $cmd &>/dev/null; then
-        echo -e "${red}缺少依赖：${cmd}，请先安装！${reset}"
-        exit 1
+        echo -e "${yellow}检测到缺少依赖：${cmd}${reset}"
+        read -rp "是否自动安装？[Y/n]: " choice
+        choice=${choice:-Y}
+        if [[ $choice =~ ^[Yy]$ ]]; then
+            sudo apt update -y && sudo apt install -y $cmd
+        else
+            echo -e "${red}缺少依赖 ${cmd}，无法继续运行。${reset}"
+            exit 1
+        fi
     fi
 done
 
-# 打印表头
-printf "\n${cyan}%-15s %-10s %-12s %-20s %-20s${reset}\n" "IP" "延时(ms)" "国家" "地区" "ISP"
+# 交互输入目标地址
+read -rp "请输入要追踪的目标域名或IP: " target
+if [ -z "$target" ]; then
+    echo -e "${red}错误：目标不能为空！${reset}"
+    exit 1
+fi
+
+echo -e "\n${cyan}开始追踪：${target}${reset}"
+echo "---------------------------------------------------------------------------------------------"
+printf "${cyan}%-3s %-15s %-10s %-12s %-18s %-20s${reset}\n" "序" "IP" "延时(ms)" "国家" "地区" "ISP"
 echo "---------------------------------------------------------------------------------------------"
 
-# 获取系统中所有可用的出口 IP
-ip_list=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^127|255$' | sort -u)
-
-for ip in $ip_list; do
-    # 获取公网出口 IP
-    public_ip=$(curl -s --interface "$ip" https://api.ipify.org)
-    if [ -z "$public_ip" ]; then
-        printf "${red}%-15s %-10s %-12s %-20s %-20s${reset}\n" "$ip" "N/A" "N/A" "N/A" "N/A"
+# 执行 traceroute
+hop=0
+traceroute -n "$target" 2>/dev/null | while read -r line; do
+    ip=$(echo "$line" | grep -oP '\b\d{1,3}(\.\d{1,3}){3}\b' | head -n1)
+    if [ -z "$ip" ]; then
         continue
     fi
+    hop=$((hop + 1))
 
-    # 平均延时计算（三次 ping）
+    # 计算平均延时（3次ping）
     total=0
     count=0
     for i in {1..3}; do
-        time=$(ping -c 1 -W 1 "$public_ip" 2>/dev/null | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
+        time=$(ping -c 1 -W 1 "$ip" 2>/dev/null | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
         if [[ $time =~ ^[0-9.]+$ ]]; then
             total=$(echo "$total + $time" | bc)
             count=$((count + 1))
@@ -50,13 +62,13 @@ for ip in $ip_list; do
         latency="N/A"
     fi
 
-    # 获取 IP 详细信息
-    ipinfo=$(curl -s "https://ipapi.co/${public_ip}/json/")
-    country=$(echo "$ipinfo" | jq -r '.country_name // "未知"')
-    region=$(echo "$ipinfo" | jq -r '.region // "未知"')
-    isp=$(echo "$ipinfo" | jq -r '.org // "未知"')
+    # 查询 IP 地理信息
+    info=$(curl -s "https://ipapi.co/${ip}/json/")
+    country=$(echo "$info" | jq -r '.country_name // "未知"')
+    region=$(echo "$info" | jq -r '.region // "未知"')
+    isp=$(echo "$info" | jq -r '.org // "未知"')
 
-    # 根据延时值着色
+    # 延时颜色判断
     if [[ "$latency" == "N/A" ]]; then
         color=$red
     elif (( $(echo "$latency < 100" | bc -l) )); then
@@ -67,7 +79,6 @@ for ip in $ip_list; do
         color=$red
     fi
 
-    # 打印结果行
-    printf "${cyan}%-15s${reset} ${color}%-10s${reset} %-12s %-20s %-20s\n" \
-        "$public_ip" "$latency" "$country" "$region" "$isp"
+    printf "%-3s %-15s ${color}%-10s${reset} %-12s %-18s %-20s\n" \
+        "$hop" "$ip" "$latency" "$country" "$region" "$isp"
 done
