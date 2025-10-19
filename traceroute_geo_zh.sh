@@ -1,8 +1,8 @@
 #!/bin/bash
-# traceroute_geo_zh_v2.sh
+# traceroute_geo_zh_v3.sh
 # 作者: Tong Jun & GPT-5
-# 功能: 显示路由追踪节点的IP、延时、地理信息（中文）
-# 版本: 2025-10-20
+# 功能: 路由追踪 + IP 中文地理信息 + 延时 + 并行查询 + 缓存
+# 日期: 2025-10-20
 
 set -e
 
@@ -25,9 +25,11 @@ if [[ -z "$TARGET" ]]; then
 fi
 echo
 
-# ===== 缓存函数 =====
+# ===== 缓存查询函数 =====
 lookup_ipinfo() {
     local ip="$1"
+    [[ "$ip" == "*" ]] && echo "超时 | - | -" && return
+
     local cached
     cached=$(grep "^$ip," "$CACHE_FILE" 2>/dev/null || true)
     if [[ -n "$cached" ]]; then
@@ -43,17 +45,16 @@ lookup_ipinfo() {
     echo "$ip,$result" >>"$CACHE_FILE"
     echo "$result"
 }
+export -f lookup_ipinfo  # ✅ 关键点：让 parallel 可识别
 
-# ===== 获取 traceroute 原始结果 =====
+# ===== 路由追踪 =====
 echo "开始追踪：$TARGET"
 echo "---------------------------------------------------------------------------------------------"
 echo -e "序\tIP\t\t延时(ms)\t国家\t地区\tISP"
 echo "---------------------------------------------------------------------------------------------"
 
-# 解析 traceroute 输出
 RAW=$(traceroute -n "$TARGET" 2>/dev/null || true)
 
-# 提取 hop + IP + 延时
 HOPS=$(echo "$RAW" | awk '/^[ 0-9]/ {
     ip=""; time="";
     for(i=1;i<=NF;i++){
@@ -63,19 +64,15 @@ HOPS=$(echo "$RAW" | awk '/^[ 0-9]/ {
     if(ip!="") print NR" "ip" "time;
 }')
 
-# ===== 并行查询地理信息 =====
+# ===== 并行查询 =====
 echo "$HOPS" | parallel --colsep ' ' --jobs 10 '
     hop={1}; ip={2}; delay={3};
-    if [[ "$ip" == "*" ]]; then
-        printf "%-3s %-15s %-10s %-8s %-15s %-20s\n" "$hop" "*" "超时" "-" "-" "-";
-    else
-        info=$(bash -c "lookup_ipinfo $ip")
-        country=$(echo "$info" | cut -d "|" -f1 | xargs)
-        region=$(echo "$info" | cut -d "|" -f2 | xargs)
-        city=$(echo "$info" | cut -d "|" -f3 | xargs)
-        isp=$(echo "$info" | cut -d "|" -f4 | xargs)
-        printf "%-3s %-15s %-10s %-8s %-15s %-20s\n" "$hop" "$ip" "$delay" "$country" "$city" "$isp";
-    fi
+    info=$(lookup_ipinfo "$ip")
+    country=$(echo "$info" | cut -d "|" -f1 | xargs)
+    region=$(echo "$info" | cut -d "|" -f2 | xargs)
+    city=$(echo "$info" | cut -d "|" -f3 | xargs)
+    isp=$(echo "$info" | cut -d "|" -f4 | xargs)
+    printf "%-3s %-15s %-10s %-8s %-15s %-20s\n" "$hop" "$ip" "$delay" "$country" "$city" "$isp";
 '
 
 echo "---------------------------------------------------------------------------------------------"
