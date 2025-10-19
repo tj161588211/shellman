@@ -1,120 +1,73 @@
-#!/usr/bin/env bash
-# traceroute_geo_zh.sh
-# 交互式/非交互式路由追踪并显示中文地理信息（含每跳延时）
-# 用法:
-#   交互式: ./traceroute_geo_zh.sh
-#   非交互（单次执行并输出）: ./traceroute_geo_zh.sh example.com
-#
-# 依赖: traceroute curl jq awk sed bc
-# Ubuntu 安装: sudo apt update && sudo apt install -y traceroute curl jq bc
+#!/bin/bash
+# =====================================
+# 多出口 IP 信息检测脚本（延时优化版）
+# 功能：检测每个公网出口 IP 的平均延时、国家、地区和 ISP
+# =====================================
 
-set -o pipefail
-API_URL="http://ip-api.com/json"
-FIELDS="status,country,regionName,city,isp,org,lat,lon,query,as"
-LANG_PARAM="zh-CN"
+# 彩色输出定义
+green="\e[32m"
+yellow="\e[33m"
+red="\e[31m"
+cyan="\e[36m"
+reset="\e[0m"
 
-check_deps() {
-  for cmd in traceroute curl jq awk sed bc; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-      echo "缺少依赖: $cmd"
-      echo "请先安装: sudo apt update && sudo apt install -y traceroute curl jq bc"
-      exit 3
+# 检查依赖
+for cmd in curl jq ping bc; do
+    if ! command -v $cmd &>/dev/null; then
+        echo -e "${red}缺少依赖：${cmd}，请先安装！${reset}"
+        exit 1
     fi
-  done
-}
+done
 
-query_ip() {
-  local ip=$1
-  curl -s --max-time 8 "${API_URL}/${ip}?fields=${FIELDS}&lang=${LANG_PARAM}"
-}
+# 打印表头
+printf "\n${cyan}%-15s %-10s %-12s %-20s %-20s${reset}\n" "IP" "延时(ms)" "国家" "地区" "ISP"
+echo "---------------------------------------------------------------------------------------------"
 
-# 提取平均 RTT（毫秒）
-extract_avg_rtt() {
-  local line="$1"
-  avg=$(echo "$line" | grep -oE '([0-9]+\.[0-9]+|[0-9]+) ms' | sed 's/ ms$//' | awk '{s+=$1; n+=1} END{ if(n>0) printf "%.2f", s/n; else print "-"}')
-  echo "$avg"
-}
+# 获取系统中所有可用的出口 IP
+ip_list=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^127|255$' | sort -u)
 
-format_and_print() {
-  local hop=$1; local ip=$2; local resp="$3"; local rtt_avg="$4"
-
-  if [[ -z "$resp" ]]; then
-    printf "%-4s %-18s %-28s %-20s %-20s %-12s %-8s %s\n" "$hop" "$ip" "error" "-" "-" "-" "-" "-"
-    return
-  fi
-
-  ok=$(echo "$resp" | jq -r '.status' 2>/dev/null || echo "fail")
-  if [[ "$ok" != "success" ]]; then
-    message=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)
-    [[ -z "$message" ]] && message="unknown"
-    printf "%-4s %-18s %-28s %-20s %-20s %-12s %-8s %s\n" "$hop" "$ip" "$message" "-" "-" "-" "$rtt_avg" "-"
-    return
-  fi
-
-  country=$(echo "$resp" | jq -r '.country // "-"')
-  region=$(echo "$resp" | jq -r '.regionName // ""')
-  city=$(echo "$resp" | jq -r '.city // "-"')
-  isp=$(echo "$resp" | jq -r '(.isp // "") + (if .org then " / " + .org else "" end)')
-  lat=$(echo "$resp" | jq -r '.lat // ""')
-  lon=$(echo "$resp" | jq -r '.lon // ""')
-  as=$(echo "$resp" | jq -r '.as // "-"')
-
-  [[ -n "$region" && "$region" != "" ]] && country_region="${country} / ${region}" || country_region="$country"
-  latlon="-"; [[ -n "$lat" && -n "$lon" ]] && latlon="${lat},${lon}"
-
-  printf "%-4s %-18s %-28s %-20s %-20s %-12s %-8s %s\n" "$hop" "$ip" "$country_region" "$city" "$isp" "$latlon" "$rtt_avg" "$as"
-}
-
-do_traceroute() {
-  local target=$1
-  local max_hops=${2:-30}
-
-  echo "开始 traceroute -> $target (最大跳数: $max_hops)"
-  TR_OUTPUT=$(traceroute -n -m "$max_hops" "$target" 2>/dev/null)
-  [[ $? -ne 0 || -z "$TR_OUTPUT" ]] && { echo "traceroute 执行失败，请检查网络。"; return 1; }
-
-  printf "%-4s %-18s %-28s %-20s %-20s %-12s %-8s %s\n" "Hop" "IP" "国家/省份" "城市" "ISP/组织" "经纬度" "延时(ms)" "AS"
-  echo "-----------------------------------------------------------------------------------------------------------------------------------------"
-
-  echo "$TR_OUTPUT" | tail -n +2 | while IFS= read -r line; do
-    hop=$(echo "$line" | awk '{print $1}')
-    ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
-    [[ -z "$ip" ]] && ip=$(echo "$line" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n1)
-    rtt_avg=$(extract_avg_rtt "$line")
-
-    if [[ -z "$ip" ]]; then
-      printf "%-4s %-18s %-28s %-20s %-20s %-12s %-8s %s\n" "$hop" "*" "-" "-" "-" "-" "$rtt_avg" "-"
-      continue
+for ip in $ip_list; do
+    # 获取公网出口 IP
+    public_ip=$(curl -s --interface "$ip" https://api.ipify.org)
+    if [ -z "$public_ip" ]; then
+        printf "${red}%-15s %-10s %-12s %-20s %-20s${reset}\n" "$ip" "N/A" "N/A" "N/A" "N/A"
+        continue
     fi
 
-    resp=$(query_ip "$ip")
-    format_and_print "$hop" "$ip" "$resp" "$rtt_avg"
-    sleep 0.2
-  done
-}
+    # 平均延时计算（三次 ping）
+    total=0
+    count=0
+    for i in {1..3}; do
+        time=$(ping -c 1 -W 1 "$public_ip" 2>/dev/null | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
+        if [[ $time =~ ^[0-9.]+$ ]]; then
+            total=$(echo "$total + $time" | bc)
+            count=$((count + 1))
+        fi
+    done
+    if [ $count -gt 0 ]; then
+        latency=$(echo "scale=1; $total / $count" | bc)
+    else
+        latency="N/A"
+    fi
 
-interactive_loop() {
-  while true; do
-    echo
-    read -rp "请输入要 traceroute 的目标（域名或 IP），或输入 q 退出: " target
-    target=${target//[[:space:]]/}
-    [[ -z "$target" ]] && { echo "输入为空，请重试。"; continue; }
-    [[ "$target" =~ ^[qQ]$ ]] && { echo "退出。"; break; }
+    # 获取 IP 详细信息
+    ipinfo=$(curl -s "https://ipapi.co/${public_ip}/json/")
+    country=$(echo "$ipinfo" | jq -r '.country_name // "未知"')
+    region=$(echo "$ipinfo" | jq -r '.region // "未知"')
+    isp=$(echo "$ipinfo" | jq -r '.org // "未知"')
 
-    read -rp "最大跳数 (默认 30): " max_hops
-    max_hops=${max_hops:-30}
+    # 根据延时值着色
+    if [[ "$latency" == "N/A" ]]; then
+        color=$red
+    elif (( $(echo "$latency < 100" | bc -l) )); then
+        color=$green
+    elif (( $(echo "$latency < 200" | bc -l) )); then
+        color=$yellow
+    else
+        color=$red
+    fi
 
-    do_traceroute "$target" "$max_hops"
-    echo "完成：$target"
-  done
-}
-
-check_deps
-
-if [[ -n "$1" ]]; then
-  do_traceroute "$1" 30
-else
-  interactive_loop
-fi
-
-exit 0
+    # 打印结果行
+    printf "${cyan}%-15s${reset} ${color}%-10s${reset} %-12s %-20s %-20s\n" \
+        "$public_ip" "$latency" "$country" "$region" "$isp"
+done
