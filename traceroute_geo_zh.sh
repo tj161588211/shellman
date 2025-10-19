@@ -1,79 +1,122 @@
-#!/bin/bash
-# traceroute_geo_zh_v3.sh
-# 作者: Tong Jun & GPT-5
-# 功能: 路由追踪 + IP 中文地理信息 + 延时 + 并行查询 + 缓存
-# 日期: 2025-10-20
+#!/usr/bin/env bash
+# traceroute_geo_zh.sh（精简版，无CSV，带延时信息）
 
-set -e
+set -o pipefail
+API_URL="http://ip-api.com/json"
+FIELDS="status,country,regionName,city,isp,org,lat,lon,query,as"
+LANG_PARAM="zh-CN"
 
-CACHE_FILE="/tmp/ipinfo_cache.txt"
-
-# ===== 工具检查 =====
-for cmd in traceroute curl jq parallel; do
-    if ! command -v $cmd &>/dev/null; then
-        echo "正在安装缺失依赖：$cmd ..."
-        apt update -y &>/dev/null
-        apt install -y $cmd &>/dev/null
+check_deps() {
+  for cmd in traceroute curl jq awk sed; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "缺少依赖: $cmd"
+      echo "请先安装: sudo apt update && sudo apt install -y traceroute curl jq"
+      exit 3
     fi
-done
-
-# ===== 输入目标 =====
-read -rp "请输入要追踪的目标域名或IP: " TARGET
-if [[ -z "$TARGET" ]]; then
-    echo "未输入目标，退出。"
-    exit 1
-fi
-echo
-
-# ===== 缓存查询函数 =====
-lookup_ipinfo() {
-    local ip="$1"
-    [[ "$ip" == "*" ]] && echo "超时 | - | -" && return
-
-    local cached
-    cached=$(grep "^$ip," "$CACHE_FILE" 2>/dev/null || true)
-    if [[ -n "$cached" ]]; then
-        echo "${cached#*,}"
-        return
-    fi
-
-    local result
-    result=$(curl -s "https://ipinfo.io/${ip}/json" | jq -r '[.country, .region, .city, .org] | join(" | ")')
-    if [[ -z "$result" || "$result" == "null | null | null | null" ]]; then
-        result="未知 | 未知 | 未知 | 未知"
-    fi
-    echo "$ip,$result" >>"$CACHE_FILE"
-    echo "$result"
+  done
 }
-export -f lookup_ipinfo  # ✅ 关键点：让 parallel 可识别
 
-# ===== 路由追踪 =====
-echo "开始追踪：$TARGET"
-echo "---------------------------------------------------------------------------------------------"
-echo -e "序\tIP\t\t延时(ms)\t国家\t地区\tISP"
-echo "---------------------------------------------------------------------------------------------"
+query_ip() {
+  local ip=$1
+  curl -s --max-time 8 "${API_URL}/${ip}?fields=${FIELDS}&lang=${LANG_PARAM}"
+}
 
-RAW=$(traceroute -n "$TARGET" 2>/dev/null || true)
+format_and_print() {
+  local hop=$1; local ip=$2; local latency=$3; local resp="$4"
 
-HOPS=$(echo "$RAW" | awk '/^[ 0-9]/ {
-    ip=""; time="";
-    for(i=1;i<=NF;i++){
-        if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ip=$i;
-        if($i ~ /^[0-9.]+ ms$/){time=$i; break}
-    }
-    if(ip!="") print NR" "ip" "time;
-}')
+  if [[ -z "$resp" ]]; then
+    printf "%-4s %-22s %-10s %-28s %-20s %-20s %-12s %s\n" "$hop" "$ip" "$latency" "error" "-" "-" "-" "-"
+    return
+  fi
 
-# ===== 并行查询 =====
-echo "$HOPS" | parallel --colsep ' ' --jobs 10 '
-    hop={1}; ip={2}; delay={3};
-    info=$(lookup_ipinfo "$ip")
-    country=$(echo "$info" | cut -d "|" -f1 | xargs)
-    region=$(echo "$info" | cut -d "|" -f2 | xargs)
-    city=$(echo "$info" | cut -d "|" -f3 | xargs)
-    isp=$(echo "$info" | cut -d "|" -f4 | xargs)
-    printf "%-3s %-15s %-10s %-8s %-15s %-20s\n" "$hop" "$ip" "$delay" "$country" "$city" "$isp";
-'
+  ok=$(echo "$resp" | jq -r '.status' 2>/dev/null || echo "fail")
+  if [[ "$ok" != "success" ]]; then
+    message=$(echo "$resp" | jq -r '.message // "unknown"')
+    printf "%-4s %-22s %-10s %-28s %-20s %-20s %-12s %s\n" "$hop" "$ip" "$latency" "$message" "-" "-" "-" "-"
+    return
+  fi
 
-echo "---------------------------------------------------------------------------------------------"
-echo "路由追踪完成！"
+  country=$(echo "$resp" | jq -r '.country // "-"')
+  region=$(echo "$resp" | jq -r '.regionName // ""')
+  city=$(echo "$resp" | jq -r '.city // "-"')
+  isp=$(echo "$resp" | jq -r '(.isp // "") + (if .org then " / " + .org else "" end)')
+  lat=$(echo "$resp" | jq -r '.lat // ""')
+  lon=$(echo "$resp" | jq -r '.lon // ""')
+  as=$(echo "$resp" | jq -r '.as // "-"')
+
+  [[ -n "$region" && "$region" != "" ]] && country_region="${country} / ${region}" || country_region="$country"
+  [[ -n "$lat" && -n "$lon" ]] && latlon="${lat},${lon}" || latlon="-"
+
+  printf "%-4s %-22s %-10s %-28s %-20s %-20s %-12s %s\n" "$hop" "$ip" "$latency" "$country_region" "$city" "$isp" "$latlon" "$as"
+}
+
+do_traceroute() {
+  local target=$1
+  local max_hops=${2:-30}
+
+  echo "开始 traceroute -> $target (最大跳数: $max_hops)"
+  TR_OUTPUT=$(traceroute -n -m "$max_hops" "$target" 2>/dev/null)
+  if [[ $? -ne 0 || -z "$TR_OUTPUT" ]]; then
+    echo "traceroute 执行失败，请检查目标或网络。"
+    return 1
+  fi
+
+  printf "%-4s %-22s %-10s %-28s %-20s %-20s %-12s %s\n" "Hop" "IP" "延时(ms)" "国家/省份" "城市" "ISP/组织" "经纬度" "AS"
+  echo "----------------------------------------------------------------------------------------------------------------------------------------------------"
+
+  echo "$TR_OUTPUT" | tail -n +2 | while IFS= read -r line; do
+    hop=$(echo "$line" | awk '{print $1}')
+    ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)
+    if [[ -z "$ip" ]]; then
+      ip=$(echo "$line" | grep -oE '([0-9a-fA-F:]+:+)+[0-9a-fA-F]+' | head -n1)
+    fi
+
+    latency=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\s*ms' | awk '{sum+=$1; n++} END{if(n>0) printf "%.2f", sum/n; else print "-"}')
+
+    if [[ -z "$ip" ]]; then
+      printf "%-4s %-22s %-10s %-28s %-20s %-20s %-12s %s\n" "$hop" "*" "-" "-" "-" "-" "-" "-"
+      continue
+    fi
+
+    resp=$(query_ip "$ip")
+    format_and_print "$hop" "$ip" "$latency" "$resp"
+    sleep 0.2
+  done
+
+  return 0
+}
+
+interactive_loop() {
+  while true; do
+    echo
+    read -rp "请输入要 traceroute 的目标（域名或 IP），或输入 q 退出: " target
+    target=${target//[[:space:]]/}
+    if [[ -z "$target" ]]; then
+      echo "输入为空，重试。"
+      continue
+    fi
+    if [[ "$target" == "q" || "$target" == "Q" ]]; then
+      echo "退出。"
+      break
+    fi
+
+    read -rp "最大跳数 (默认 30): " max_hops
+    max_hops=${max_hops:-30}
+
+    do_traceroute "$target" "$max_hops"
+    echo "完成：$target"
+  done
+}
+
+# main
+check_deps
+
+if [[ -n "$1" ]]; then
+  target="$1"
+  do_traceroute "$target" 30
+  exit 0
+else
+  interactive_loop
+fi
+
+exit 0
