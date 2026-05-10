@@ -454,10 +454,6 @@ docker run -d \
 --restart unless-stopped \
 --network host \
 --ulimit nofile=1048576:1048576 \
---sysctl net.core.rmem_max=33554432 \
---sysctl net.core.wmem_max=33554432 \
---sysctl net.ipv4.udp_rmem_min=262144 \
---sysctl net.ipv4.udp_wmem_min=262144 \
 -v ${CONFIG_DIR}/srt.conf:/usr/local/srs/conf/srt.conf \
 ossrs/srs:6 \
 ./objs/srs -c conf/srt.conf
